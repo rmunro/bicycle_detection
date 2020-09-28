@@ -19,15 +19,19 @@ import sqlite3
 import pickle
 import zlib
 import math
+import statistics
 import datetime
 
 
 verbose = True
 
+
+
 feature_store_path = "data/feature_store.db"
 
 feature_store = sqlite3.connect(feature_store_path)
 
+eel.init('./')
 
 resnext50_model = models.resnext50_32x4d(pretrained=True)
 # strip last layer of resnext:
@@ -44,31 +48,27 @@ bicycle_label_oi = "/m/0199g" # label within open images dataset
 
 
 class SimpleClassifier(nn.Module):  # inherit pytorch's nn.Module
-    """ Classifier with 1 hidden layer 
+    """ Linear Classifier with no hiden layers
 
     """
     
     def __init__(self, num_labels, num_inputs):
         super(SimpleClassifier, self).__init__() # call parent init
-
-        # Define model with one hidden layer with 128 neurons
-        self.linear1 = nn.Linear(num_inputs, 128)
-        self.linear2 = nn.Linear(128, num_labels)
+        self.linear = nn.Linear(num_inputs, num_labels)
+        
 
     def forward(self, feature_vec, return_all_layers=False):
         # Define how data is passed through the model and what gets returned
 
-        hidden1 = self.linear1(feature_vec).clamp(min=0) # ReLU
-        output = self.linear2(hidden1)
+        output = self.linear(feature_vec)
         log_softmax = F.log_softmax(output, dim=1)
 
         if return_all_layers:
-            return [hidden1, output, log_softmax]
+            return [output, log_softmax]
         else:
             return log_softmax
-                                
-
-
+    
+    
 
 
 COCO_INSTANCE_CATEGORY_NAMES = ['__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
@@ -195,7 +195,7 @@ def make_feature_vector(image_id, url, label=""):
     return vector.view(1, -1)
     
 
-def load_annotations(annotation_filepath, image_filepath):
+def load_annotations(annotation_filepath, image_filepath, load_all = False):
     global bicycle_label_oi
     annotations = {}
     annotated_data = []
@@ -213,24 +213,25 @@ def load_annotations(annotation_filepath, image_filepath):
     for row in csvobj:
         # ImageID,Subset,OriginalURL,OriginalLandingURL,License,AuthorProfileURL,Author,Title,OriginalSize,OriginalMD5,Thumbnail300KURL,Rotation
         image_id = row[0]
-        if image_id in annotations:
+        if image_id in annotations or load_all:
             url = row[2]
             if url_is_missing(url) or is_bad_image(url):
                 continue
                 
-            # TEMP:
-            if not get_features_from_store(image_id):
-                continue # TODO: remove later
+            if image_id in annotations:                 
+                label = annotations[image_id]
+            else:
+                #implicit negative
+                label = 0
                 
-            annotation = annotations[image_id]
-            annotated_data.append([image_id,url,annotation])
+            annotated_data.append([image_id,url,label])
                   
                   
     return annotated_data
     
   
 
-def train_model(training_data, validation_data = "", evaluation_data = "", batch_size=100, num_epochs=1000, num_labels=2, num_inputs=2058, model=None):
+def train_model(training_data, validation_data = "", evaluation_data = "", batch_size=50, num_epochs=2000, num_labels=2, num_inputs=2058, model=None):
     """Train model on the given training_data
 
     Tune with the validation_data
@@ -266,7 +267,6 @@ def train_model(training_data, validation_data = "", evaluation_data = "", batch
             url = item[1]
             label = int(item[2])
 
-            model.zero_grad() 
 
             feature_vec = make_feature_vector(image_id, url)
             if feature_vec == None:
@@ -279,17 +279,20 @@ def train_model(training_data, validation_data = "", evaluation_data = "", batch
 
             # compute loss function, do backward pass, and update the gradient
             loss = loss_function(log_probs, target)
+            
+            model.zero_grad() 
+
             loss.backward()
             optimizer.step()    
 
 
-        fscore, auc = evaluate_model(model, evaluation_data)
+        fscore, auc, precision, recall = evaluate_model(model, evaluation_data)
         fscore = round(fscore,3)
         auc = round(auc,3)
-        print("Fscore/AUC = "+str(fscore)+" "+str(auc))
+        print("Fscore/AUC = "+str(fscore)+" "+str(auc)+" "+str(precision)+" "+str(recall))
 
     
-    fscore, auc = evaluate_model(model, evaluation_data)
+    fscore, auc, precision, recall = evaluate_model(model, evaluation_data)
     fscore = round(fscore,3)
     auc = round(auc,3)
 
@@ -319,6 +322,11 @@ def evaluate_model(model, evaluation_data):
     true_pos = 0.0 # true positives, etc 
     false_pos = 0.0
     false_neg = 0.0
+    true_neg = 0.0
+    
+    total_loss = 0.0
+    
+    loss_function = nn.NLLLoss()
 
     with torch.no_grad():
         for item in evaluation_data:
@@ -331,28 +339,42 @@ def evaluate_model(model, evaluation_data):
                 continue
             log_probs = model(feature_vector)
 
+
             # get probability that item is bicycle
             prob_bicycle = math.exp(log_probs.data.tolist()[0][1]) 
 
+            # record loss if we have a label
+            if label != None:
+                target = torch.LongTensor([int(label)])           
+                loss = loss_function(log_probs, target)
+                total_loss += loss
+
+        
             if(label == "1"):
                 # true label is bicycle
                 bicycle_confs.append(prob_bicycle)
                 if prob_bicycle > 0.5:
                     true_pos += 1.0
-                else:
+                elif prob_bicycle < 0.5:
                     false_neg += 1.0
-                    print("FN: "+url)
 
             else:
                 # no bicycle
                 not_bicycle_confs.append(prob_bicycle)
                 if prob_bicycle > 0.5:
                     false_pos += 1.0
-                    print("FP: "+url)
+                elif prob_bicycle < 0.5:
+                    true_neg += 1.0
+
+    print(str(true_pos)+" "+str(false_pos)+" "+str(false_neg)+" "+str(true_neg))
+
+    ave_loss = total_loss / len(evaluation_data)
 
     # Get FScore
     if true_pos == 0.0:
         fscore = 0.0
+        precision = 0.0
+        recall = 0.0
     else:
         precision = true_pos / (true_pos + false_pos)
         recall = true_pos / (true_pos + false_neg)
@@ -363,16 +385,20 @@ def evaluate_model(model, evaluation_data):
     total_greater = 0 # count of how many total have higher confidence
     for conf in bicycle_confs:
         for conf2 in not_bicycle_confs:
-            if conf < conf2:
+            if conf <= conf2:
                 break
             else:                  
                 total_greater += 1
 
-
     denom = len(not_bicycle_confs) * len(bicycle_confs) 
     auc = total_greater / denom
 
-    return[fscore, auc]
+    conf_b = statistics.mean(bicycle_confs)
+    conf_n = statistics.mean(not_bicycle_confs)
+    print("ave confs: "+str(conf_b)+" "+str(conf_n))
+    print("ave loss: "+str(ave_loss))
+
+    return[fscore, auc, precision, recall]
 
 
  
@@ -450,27 +476,47 @@ def get_features_from_store(image_id):
             return(features)
         
         return False
+
+
+@eel.expose
+def get_next_image():
+    shuffle(validation_annotations)
+    image_data = validation_annotations[0]
+    image_id = image_data[0]
+    url = image_data[1]
+    print(url)
+    return(url)
     
 create_feature_tables()
 
 
+annotation_filepath = 'data/validation-annotations-human-imagelabels.csv.gz'
+image_filepath = 'data/validation-images-with-rotation.csv.gz'  
+validation_annotations = load_annotations(annotation_filepath, image_filepath, load_all = False)  
+
+
+eel.start('bicycle_detection.html', size=(800, 600))
+
+
+
+'''
 annotation_filepath = 'data/oidv6-train-annotations-human-imagelabels.csv.gz'    
 image_filepath = 'data/oidv6-train-images-with-labels-with-rotation.csv.gz'
-
-training_annotations = load_annotations(annotation_filepath, image_filepath)  
-
     
 annotation_filepath = 'data/validation-annotations-human-imagelabels.csv.gz'
 image_filepath = 'data/validation-images-with-rotation.csv.gz'  
   
-validation_annotations = load_annotations(annotation_filepath, image_filepath)  
+validation_annotations = load_annotations(annotation_filepath, image_filepath, load_all = True)  
    
 annotation_filepath = 'data/test-annotations-human-imagelabels.csv.gz'
 image_filepath = 'data/test-images-with-rotation.csv.gz'  
   
 evaluation_annotations = load_annotations(annotation_filepath, image_filepath)  
    
-# TEMP TO TEST   
-# training_annotations = validation_annotations
+training_annotations = load_annotations(annotation_filepath, image_filepath, load_all = True)  
 
 model = train_model(training_annotations, validation_annotations, evaluation_annotations)
+'''
+
+
+
