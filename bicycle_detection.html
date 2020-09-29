@@ -6,12 +6,14 @@
 
 <style>
 html,body,h1,h2,h3,h4,h5 {font-family: "Raleway", sans-serif}
-td, tr {vertical-align: top}
+td, tr {vertical-align: top; background-color: grey; text-align: center;}
 .image {
   max-height: 256px;
-  max-width: 256px;
+  max-width: 256px;  
 }
-
+.annotation{
+background-color: white;
+}
 
 </style>
 
@@ -20,7 +22,7 @@ td, tr {vertical-align: top}
 
 </head>
 
-<body class="w3-light-grey" style="margin-left:5px;" onload="get_next_report();">
+<body class="w3-light-grey" style="margin-left:5px;">
 
 
 <div class="w3-top w3-black">
@@ -31,8 +33,13 @@ td, tr {vertical-align: top}
 <div class="w3-main" style="margin-left:10px;margin-top:40px;">
 
 <button onclick="get_next_image();" id="get_image">Get Next Image</button></h5>
+<button onclick="remove_first_image();" id="rem_image">Remove Image</button></h5>
 <br />
-<img class="image" src="" id="image_1" />
+<table>
+<tr><td>
+<div id="images"></div>
+</td><td></td></tr>
+</table>
 
 
 </div>

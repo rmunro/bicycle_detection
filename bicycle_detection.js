@@ -1,33 +1,32 @@
 
 
+var max_images = 10;
+
+
+async function remove_first_image(){
+    images = document.getElementById("images").children;
+    if(images.length > 0){
+    	images[0].remove();
+    }
+}
 
 async function get_next_image(){   
    
     // GET NEXT REPORT
-    image_url = await eel.get_next_image()(); // Call to python function
-
-    document.getElementById('image_1').src = image_url; 
-
-    /*
-    report_id = report[0];    
-    report_text = report[1];
-    report_date = report[2];
-
     
-    document.getElementById('report_id').value = report_id;    
-    document.getElementById('report_text').value = report_text;    
-    document.getElementById('annotation').innerHTML = report_text;
-    document.getElementById('report_date').value = report_date;    
 
-    document.getElementById('hazard').value = "";
-    document.getElementById('food').value = "";
-    document.getElementById('origin').value = "";
-    document.getElementById('destination').value = "";
+    images = document.getElementById("images");
 
-    document.getElementById('hazard').focus(); 
+    current = images.children.length;
+    console.log(current);
 
-    get_candidate_spans(report_text); // add autocomplete for hazards
-    */
+    for(var i = current; i <= max_images; i++){
+        image_url = await eel.get_next_image()(); // Call to python function
+    	new_image = document.createElement("IMG");
+    	new_image.setAttribute("src", image_url);
+    	new_image.setAttribute("class", "image");
+		images.appendChild(new_image);     
+	}
     
 }
 
