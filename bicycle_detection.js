@@ -1,6 +1,6 @@
 
 
-var max_images = 50; // max pre-loaded on screen
+var max_images = 20; // max pre-loaded on screen
 
 
 async function remove_first_image(){
@@ -152,7 +152,7 @@ setInterval(async function(){
 
 // LOG ANNOTATIONS
 document.addEventListener("keypress", function onEvent(event) {
-    console.log(event);
+    //console.log(event);
     if (event.key === "b") {
         add_annotation(true);
     }

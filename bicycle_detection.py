@@ -245,6 +245,11 @@ def load_annotations(annotation_filepath, image_filepath, load_all = False):
     
     cached_data = get_data_structure_store(image_filepath)
     if cached_data:
+        for item in cached_data:
+            image_id = item[0]
+            url = item[1]
+            image_id_urls[url] = image_id
+            
         if verbose:
             print("loaded cached data "+image_filepath)
         return cached_data
@@ -343,9 +348,7 @@ def train_model(batch_size=20, num_epochs=100, num_labels=2, num_inputs=2058, mo
         
         if len(bicycle) < min_training_items or len(not_bicycle) < min_training_items:
             if verbose or True:
-                print("Not yet enough labels to train")
-                print(len(bicycle))
-                print(len(not_bicycle))
+                print("Not yet enough labels to train: "+str(len(bicycle))+ " of "+str(len(urls)))
             return None
         
         epoch_data = bicycle + not_bicycle
@@ -669,7 +672,8 @@ def get_data_structure_store(structure_name):
                 pickled_data = zlib.decompress(compressed_data)
                 data = pickle.loads(pickled_data)
             except Exception as e:
-                print("Couldn't load "+name+" : "+str(e))
+                print("Couldn't load "+str(structure_name)+": "+str(e))
+
                 return False
             return(data)        
         return False
@@ -703,45 +707,56 @@ def get_features_from_store(image_id):
 def add_pending_annotations():
     global pending_annotations
     global image_id_urls
+    global new_training_data
     global new_training_data_path
     global total_pending
+    global verbose
     
     while True:
         not_cached = 0
 
         # copy to avoid race conditions
-        unprocessed_annotations = pending_annotations.copy()
-        if verbose:
-            print("processing "+str(len(unprocessed_annotations))+ " annotations")
-
-        for annotation in unprocessed_annotations:
-            url = annotation[0]
-            image_id = image_id_urls[url]
-            features = get_features_from_store(image_id)
-            if not features:
-                not_cached += 1
-                
-        total_pending = not_cached    
-            
-        while len(unprocessed_annotations) > 0:
-            print("saving annotation")
-            annotation = unprocessed_annotations.pop()
-    
-            url = annotation[0]
-            is_bicycle = annotation[1]
-            image_id = image_id_urls[url]
-            if is_bicycle:
-                label = 1
-            else:
-                label = 0
-            append_data(new_training_data_path, [[image_id, url, label]])
-            new_training_data[url] = label                
+        print("adding pending annotations")
         
-            if store_features:
+        found_annotation = None
+        for annotation in pending_annotations:
+            is_bicycle = annotation[1]
+            if is_bicycle:
+                if verbose:
+                    print("prioritizing positive annotation")
+                
+                label = "1"
+                url = annotation[0]
+                image_id = image_id_urls[url]
+                
+                # cache features for faster training later
+                eel.sleep(0.01) # allow other processes in
                 features = make_feature_vector(image_id, url, label)            
                 eel.sleep(0.1) # allow other processes in
-             
-        eel.sleep(1)
+                
+                append_data(new_training_data_path, [[image_id, url, label]])
+                new_training_data[url] = label
+                found_annotation = annotation
+        
+        if found_annotation:
+            pending_annotations.remove(found_annotation) 
+                   
+        elif len(pending_annotations) > 0:
+            label = "0"
+            annotation = pending_annotations.pop()
+            url = annotation[0]
+            image_id = image_id_urls[url]
+                
+            # cache features for faster training later
+            eel.sleep(0.01) # allow other processes in
+            features = make_feature_vector(image_id, url, label)            
+            eel.sleep(0.1) # allow other processes in
+                
+            append_data(new_training_data_path, [[image_id, url, label]])
+            new_training_data[url] = label
+            found_annotation = annotation
+        else:            
+            eel.sleep(1)
         
 
 
