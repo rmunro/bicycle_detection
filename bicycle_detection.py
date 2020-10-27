@@ -3,6 +3,7 @@ import time
 import gzip
 import csv
 import hashlib
+import random
 from random import shuffle
 
 ##
@@ -40,7 +41,7 @@ evaluation_images_path = 'data/test-images-with-rotation.csv.gz'
   
 new_training_data_path = 'data/new-training-data.csv'
 
-unlabeled_annotations = []  
+unlabeled_items = []  
 validation_annotations = []  
 evaluation_annotations = []
 
@@ -54,13 +55,16 @@ min_training_items = 5 # min items for each class to start training
 
 high_uncertainty_items = [] # items queued for annotation because of uncertainty
 model_based_outliers = [] # items queued for annotation because they are outliers and uncertain
-number_sampled_to_cache = 1000 # how many to keep in memory to support rapid annotation
+
+number_sampled_to_cache = 10 # how many active learning samples in memory to support rapid annotation
+number_to_sample_per_train = 50 # how many items to predict over for each new model
+# TODO: make these bigger before release
+
 
 total_time = 0.0 # total time to download new images and extract features
 total_downloads = 0 # total number of images downloaded 
-total_pending = 0 # total number waiting to be processed
 
-current_accuracies = []
+current_accuracies = [-1,-1,-1,-1, -1]
 current_model = None
 
 feature_store = sqlite3.connect(feature_store_path)
@@ -306,7 +310,7 @@ def load_annotations(annotation_filepath, image_filepath, load_all = False):
     
   
 
-def train_model(batch_size=20, num_epochs=100, num_labels=2, num_inputs=2058, model=None):
+def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, model=None):
     """Train model on the given training_data
 
     Tune with the validation_data
@@ -314,9 +318,13 @@ def train_model(batch_size=20, num_epochs=100, num_labels=2, num_inputs=2058, mo
     """
     global new_training_data
     global min_training_items
+    global current_model
+    global current_accuracies
+    global number_to_sample_per_train
 
     if model == None:
         model = SimpleClassifier(num_labels, num_inputs)
+
 
     loss_function = nn.NLLLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.01)
@@ -347,7 +355,7 @@ def train_model(batch_size=20, num_epochs=100, num_labels=2, num_inputs=2058, mo
                 not_bicycle.append([image_id_urls[url], url, label])
         
         if len(bicycle) < min_training_items or len(not_bicycle) < min_training_items:
-            if verbose or True:
+            if verbose:
                 print("Not yet enough labels to train: "+str(len(bicycle))+ " of "+str(len(urls)))
             return None
         
@@ -360,53 +368,75 @@ def train_model(batch_size=20, num_epochs=100, num_labels=2, num_inputs=2058, mo
                 
         # train our model
         for item in epoch_data:
-            image_id = item[0]
-            url = item[1]
-            label = int(item[2])
-            if verbose or True:
-                print(".")
+            try:
+                image_id = item[0]
+                url = item[1]
+                label = int(item[2])
 
-            feature_vec = make_feature_vector(image_id, url)
-            if feature_vec == None:
-                print("no features for "+url)
-                continue
+                feature_vec = make_feature_vector(image_id, url)
+                if feature_vec == None:
+                    print("no features for "+url)
+                    continue
             
-            target = torch.LongTensor([int(label)])
+                target = torch.LongTensor([int(label)])
 
-            log_probs = model(feature_vec)
-            eel.sleep(0.01) # let other processes in
+                model.zero_grad() 
 
-
-            # compute loss function, do backward pass, and update the gradient
-            loss = loss_function(log_probs, target)
+                log_probs = model(feature_vec)
+                eel.sleep(0.01) # let other processes in
             
-            model.zero_grad() 
+                # compute loss function, do backward pass, and update the gradient
+                loss = loss_function(log_probs, target)
+            
+                
 
-            loss.backward()
-            optimizer.step()    
+                loss.backward()
+                optimizer.step() 
+            except RuntimeError as e:
+                print("Warning, error while training:")
+                print(e)
 
 
-        fscore, auc, precision, recall, ave_loss = evaluate_model(model, False, 100)
+        fscore, auc, precision, recall, ave_loss = evaluate_model(model, False, -1)
         fscore = round(fscore,3)
         auc = round(auc,3)
-        print("Fscore/AUC = "+str(fscore)+" "+str(auc)+" "+str(precision)+" "+str(recall))
+        if verbose:
+            print("Fscore/AUC = "+str(fscore)+" "+str(auc)+" "+str(precision)+" "+str(recall))
+        
+        if fscore > 0 and fscore > current_accuracies[0]:
+          
+            # evaluate on all *evaluation* data and save model 
+            test_fscore, test_auc, test_precision, test_recall, test_ave_loss = evaluate_model(model, True, -1)
 
-    
-    if model is not None:
-        fscore, auc, precision, recall, ave_loss = evaluate_model(model, False, 1000)
-        fscore = round(fscore,3)
-        auc = round(auc,3)
+            if verbose:
+                print("Fscore/AUC = "+str(test_fscore)+" "+str(test_auc)+" "+str(test_precision)+" "+str(test_recall))
 
-        # save model to path that is alphanumeric and includes number of items and accuracies in filename
-        timestamp = re.sub('\.[0-9]*','_',str(datetime.datetime.now())).replace(" ", "_").replace("-", "").replace(":","")
-        training_size = "_"+str(len(urls))
-        accuracies = str(fscore)+"_"+str(auc)
+
+            test_auc = round(test_auc,3)
+
+            # save model to path that is alphanumeric and includes number of items and accuracies in filename
+            timestamp = re.sub('\.[0-9]*','_',str(datetime.datetime.now())).replace(" ", "_").replace("-", "").replace(":","")
+            training_size = "_"+str(len(urls))
+            accuracies = str(test_fscore)+"_"+str(test_auc)
                      
-        model_path = "models/"+timestamp+accuracies+training_size+".params"
+            model_path = "models/"+timestamp+accuracies+training_size+".params"
+            torch.save(model.state_dict(), model_path)
+                
+            current_accuracies = [fscore, auc, precision, recall, ave_loss]
+            current_model = model
+       
+        
+    if current_model == None:
+        if verbose:
+            print("Not getting predictions: we don't have a good model yet") 
+    else:
+        if verbose:
+            print("Getting predictions across unlabeled items so we can sample with active learning")
+        
+        for i in range(0, number_to_sample_per_train):
+            get_random_prediction()
+        
 
-        torch.save(model.state_dict(), model_path)
-        # TODO: only replace model when loss and/or accuracy better on validation data
-    
     return model
   
  
@@ -420,6 +450,7 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
     
     global evaluation_annotations
     global validation_annotations
+    
 
     bicycle_confs = [] # bicycle items and their confidence of being bicycle
     not_bicycle_confs = [] # not bicycle items and their confidence of being _bicycle_
@@ -444,54 +475,54 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
 
     if len(evaluation_data) == 0:
         if verbose:
-            print("evaluation data not loaded")
-        return[0,0,0,0] # not loaded yet
+            print("data not loaded")
+        return[0,0,0,0,0] # not loaded yet
 
-    with torch.no_grad():
-        count = 0
-        for item in evaluation_data:
-            if limit > 0 and count > limit:
-                break   
+    
+    count = 0
+    for item in evaluation_data:
+        if limit > 0 and count > limit:
+            break   
         
-            image_id = item[0]
-            url = item[1]
-            label = item[2]
-            if verbose:
-                print(".")
+        image_id = item[0]
+        url = item[1]
+        label = item[2]
 
-            feature_vector = make_feature_vector(image_id, url)
-            if feature_vector == None:
-                continue
+        feature_vector = make_feature_vector(image_id, url)
+        if feature_vector == None:
+            continue
+                
+        with torch.no_grad():
             log_probs = model(feature_vector)
-            eel.sleep(0.01)
+        eel.sleep(0.01)
 
 
-            # get probability that item is bicycle
-            prob_bicycle = math.exp(log_probs.data.tolist()[0][1]) 
+        # get probability that item is bicycle
+        prob_bicycle = math.exp(log_probs.data.tolist()[0][1]) 
 
-            # record loss if we have a label
-            if label != None:
-                target = torch.LongTensor([int(label)])           
-                loss = loss_function(log_probs, target)
-                total_loss += loss
+        # record loss if we have a label
+        if label != None:
+            target = torch.LongTensor([int(label)])           
+            loss = loss_function(log_probs, target)
+            total_loss += loss
 
         
-            if(label == "1"):
-                # true label is bicycle
-                bicycle_confs.append(prob_bicycle)
-                if prob_bicycle > 0.5:
-                    true_pos += 1.0
-                elif prob_bicycle < 0.5:
-                    false_neg += 1.0
-            else:
-                # no bicycle
-                not_bicycle_confs.append(prob_bicycle)
-                if prob_bicycle > 0.5:
-                    false_pos += 1.0
-                elif prob_bicycle < 0.5:
-                    true_neg += 1.0
+        if(label == "1"):
+            # true label is bicycle
+            bicycle_confs.append(prob_bicycle)
+            if prob_bicycle > 0.5:
+                true_pos += 1.0
+            elif prob_bicycle < 0.5:
+                false_neg += 1.0
+        else:
+            # no bicycle
+            not_bicycle_confs.append(prob_bicycle)
+            if prob_bicycle > 0.5:
+                false_pos += 1.0
+            elif prob_bicycle < 0.5:
+                true_neg += 1.0
                     
-            count += 1
+        count += 1
             
     print(str(true_pos)+" "+str(false_pos)+" "+str(false_neg)+" "+str(true_neg))
 
@@ -529,6 +560,28 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
 
 
 
+def load_most_recent_model(num_labels=2, num_inputs=2058):
+    global current_model
+    global current_accuracies
+    
+    existing_models = os.listdir('models/')
+    if len(existing_models) == 0:
+        return
+
+    last_model = existing_models[-1]
+    
+    current_model = SimpleClassifier(num_labels, num_inputs)
+    current_model.load_state_dict(torch.load('models/'+last_model))
+    
+    current_accuracies = evaluate_model(current_model, False, -1)
+            
+    print("loaded model: "+last_model)
+    
+    
+        
+
+
+
 def get_quantized_logits(logits):
     ''' Returns the quanitized (0-1) logits
     
@@ -537,16 +590,20 @@ def get_quantized_logits(logits):
     return 1- (logits[0] + logits[1])
     
 
-def get_random_prediction(model):
+def get_random_prediction(model = None):
     '''Get predictions on unlabeled data 
     
     '''
-    global unlabeled_annotations
+    global unlabeled_items
     global high_uncertainty_items 
     global model_based_outliers 
     global number_sampled_to_cache
+    global current_model
     
-    random.choose(unlabeled_annotations) 
+    if model == None:
+        model = current_model 
+    
+    item = random.choice(unlabeled_items) 
     with torch.no_grad():        
         image_id = item[0]
         url = item[1]
@@ -555,25 +612,28 @@ def get_random_prediction(model):
         if feature_vector == None:
             return
             
-        log_probs, logits = model(feature_vector, return_all_layers = True)     
+        logits, log_probs = model(feature_vector, return_all_layers = True)     
     
         prob_bicycle = math.exp(log_probs.data.tolist()[0][1]) 
             
         least_conf = 2 * (1 - max(prob_bicycle, 1-prob_bicycle))
+        # TODO: work out why this is typically -20
 
         outlier_score = get_quantized_logits(logits.data.tolist()[0])
             
-        high_uncertainty_items = [] # items queued for annotation because of uncertainty
-        model_based_outliers = [] # items queued for annotation because they are outliers and uncertain
-
         if len(high_uncertainty_items) < number_sampled_to_cache:
             if verbose or True:
-                print("adding item to sampled list bc below cache")
+                print("adding an initial item to uncertainty samples")
+                print(len(high_uncertainty_items))
+            while len(item) < 5:
+                item.append("")
             item[4] = least_conf
             high_uncertainty_items.append(item)
-        elif least_conf > high_uncertainty_items[-1][0]:
+        elif least_conf > high_uncertainty_items[-1][4]:
             if verbose or True:
-                print("adding item to sampled list bc high uncertainty")
+                print("adding to uncertainty samples "+str(least_conf))
+            while len(item) < 5:
+                item.append("")            
             item[4] = least_conf
             high_uncertainty_items.append(item)
             high_uncertainty_items.pop(-1)
@@ -582,12 +642,12 @@ def get_random_prediction(model):
         if least_conf > 0.5:
             if len(model_based_outliers) < number_sampled_to_cache:
                 if verbose or True:
-                    print("adding item to sampled list bc below cache")
+                    print("adding an item initial item to outlier samples")
                 item[4] = outlier_score
                 model_based_outliers.append(item)
             elif least_conf > model_based_outliers[-1][0]:
                 if verbose or True:
-                    print("adding item to sampled list bc high outlier score")
+                    print("adding to outlier samples "+str(outlier_score))
                 item[4] = outlier_score
                 model_based_outliers.append(item)
                 model_based_outliers.pop(-1)
@@ -709,14 +769,14 @@ def add_pending_annotations():
     global image_id_urls
     global new_training_data
     global new_training_data_path
-    global total_pending
     global verbose
     
     while True:
         not_cached = 0
 
         # copy to avoid race conditions
-        print("adding pending annotations")
+        if len(pending_annotations) > 0 and verbose:
+            print("adding pending annotations")
         
         found_annotation = None
         for annotation in pending_annotations:
@@ -739,7 +799,11 @@ def add_pending_annotations():
                 found_annotation = annotation
         
         if found_annotation:
+            prior_num = len(pending_annotations)
             pending_annotations.remove(found_annotation) 
+            after_num = len(pending_annotations)
+            if after_num + 1 != prior_num:
+                print("Warning did not remove item from list")
                    
         elif len(pending_annotations) > 0:
             label = "0"
@@ -769,7 +833,7 @@ def append_data(filepath, data):
  
 @eel.expose 
 def training_loaded():
-    return len(unlabeled_annotations) > 0
+    return len(unlabeled_items) > 0
        
 @eel.expose 
 def validation_loaded():
@@ -786,11 +850,14 @@ def get_current_accuracies():
 def estimate_processing_time():
     global total_time 
     global total_downloads 
-    global total_pending 
+    global pending_annotations
+    total_pending = len(pending_annotations)
     
     if total_downloads == 0:
         return 0 # no info yet
     else:
+        if verbose:
+            print([total_time, total_downloads, total_pending])
         return (total_time / total_downloads) * total_pending
 
 @eel.expose
@@ -811,16 +878,16 @@ def add_annotation(url, is_bicycle):
 @eel.expose
 def get_next_image():
     global validation_annotations
-    global unlabeled_annotations
+    global unlabeled_items
     global test_annotations
     global high_uncertainty_items
     global model_based_outliers 
     
-    annotations = unlabeled_annotations
+    annotations = unlabeled_items
     
     if len(validation_annotations) == 0:
         return [] # not yet loaded
-    if len(unlabeled_annotations) == 0:
+    if len(unlabeled_items) == 0:
         return get_validation_image()
     
     
@@ -837,14 +904,14 @@ def get_next_image():
 
 # get image with high uncertainty    
 def get_uncertain_image():
-    # TODO
-    return []
+    global high_uncertainty_items
+    return high_uncertainty_items.pop()
 
     
 # get image that is model-based outlier and also uncertain
 def get_outlier_image():
-    # TODO
-    return []
+    global model_based_outliers 
+    return model_based_outliers.pop()
     
     
         
@@ -871,11 +938,11 @@ def get_validation_image():
         
 
 def get_random_image():
-    global unlabeled_annotations
+    global unlabeled_items
 
     url = ""
     while url == "":
-        item = random.choice(unlabeled_annotations)
+        item = random.choice(unlabeled_items)
         image_id = item[0]
         url = item[1]
         label = "" # we're getting new labels so ignore OI ones            
@@ -914,7 +981,8 @@ create_feature_tables()
 
 def load_data():
     global validation_annotations
-    global unlabeled_annotations
+    global evaluation_annotations
+    global unlabeled_items
     global test_annotations
     global new_training_data_path
     global new_training_data
@@ -924,9 +992,6 @@ def load_data():
     for item in validation_annotations:
         validation_urls[item[1]] = True
 
-    print(len(validation_annotations))
-
-
     print("loading existing annotations")
     new_training_data = load_training_data(new_training_data_path)
     print(len(new_training_data))
@@ -934,13 +999,11 @@ def load_data():
     print("loading eval")
     evaluation_annotations = load_annotations(evaluation_labels_path, evaluation_images_path, load_all = False)  
 
-    print(len(evaluation_annotations))
-
     print("loading train")
-    unlabeled_annotations = load_annotations(training_labels_path, training_images_path, load_all = True)  
+    unlabeled_items = load_annotations(training_labels_path, training_images_path, load_all = True)  
     print("all data loaded")
 
-    print(len(unlabeled_annotations))
+    load_most_recent_model()
 
 
 
@@ -951,25 +1014,16 @@ def continually_retrain():
 
 
 
-def continually_sample():
-    global current_model
-    while True:        
-        if current_model != None:
-            get_random_prediction()
-        else:
-            # no model yet, wait
-            eel.sleep(20) # Use eel.sleep(), not time.sleep()
 
 
-
-
+# It takes a while to load the data, especially first time, so we parallelize it
 eel.spawn(load_data)
 
+# Separate thread to gradually download and extract COCO and ImageNet representations
 eel.spawn(add_pending_annotations)
 
+# Continually retrain the model and get predictions over unlabeled items
 eel.spawn(continually_retrain)
-
-eel.spawn(continually_sample)
 
 
 eel.start('bicycle_detection.html', size=(1350, 900))

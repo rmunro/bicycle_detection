@@ -61,13 +61,16 @@ async function validation_loaded(){
 setInterval(async function(){ 
     //check for updated accuracy scores every 10 seconds
     processing_time = await eel.estimate_processing_time()();
-    time_div = document.getElementById("time")
+    time_div = document.getElementById("time");
+    
+    console.log("processing time: "+processing_time.toString());
+
     
     if(processing_time > 0){
-        if(processing_time < 60){
+        if(processing_time < 90){
             message = Math.floor(processing_time).toString()+" seconds ";
         }
-        else if(processing_time < 120){
+        else if(processing_time < 240){
             message = (Math.round(processing_time/30)/2).toString()+" minutes ";
         }
         else if(processing_time < 600){
@@ -77,11 +80,11 @@ setInterval(async function(){
             message = Math.round(processing_time/60).toString()+" minutes ... maybe take a short break and get some exercise ";            
         }
         else{
-            message = (Math.round(processing_time/1800)/2).toString()+" hours ... maybe have a meal or let it run for a while ";            
+            message = (Math.round(processing_time/1800)/2).toString()+" hours ... maybe have a meal and come back later ";            
         }
         
         time_div.style="visibility:visible";
-        stats.innerHTML = '<b>Time remaining to prepare annotated images for machine learning</b>: '+message; 
+        time_div.innerHTML = '<b>Estimated Time remaining to prepare annotated images for machine learning (download and extract COCO and ImageNet vectors):</b><br /> '+message; 
     }
     else{
         time_div.style="visibility:hidden";
@@ -95,11 +98,14 @@ setInterval(async function(){
 setInterval(async function(){ 
     //check for updated accuracy scores every 5 seconds
     accuracies = await eel.get_current_accuracies()();
+    console.log("accuracies: "+accuracies.toString());
     if(accuracies.length > 0){
         stats = document.getElementById("stats")
         stats.style="visibility:visible";
         fscore = accuracies[0];
-        stats.innerHTML = 'Target Accuracy: F-Score = 0.85 <br />Current Accuracy: F-Score = '+score.toString();
+        if(fscore > 0){
+            stats.innerHTML = 'Target Accuracy: F-Score = 0.85 <br />Current Accuracy: F-Score = '+fscore.toString();
+        }
     }
     
 }, 5000);
