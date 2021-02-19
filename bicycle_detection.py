@@ -5,6 +5,10 @@ import csv
 import hashlib
 import random
 from random import shuffle
+from typing import List, Optional, Dict, NamedTuple, Tuple, Any, Set, Union
+from dataclasses import dataclass
+from pathlib import Path
+
 
 ##
 
@@ -13,9 +17,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import *
-from PIL import *
-import urllib 
+from torchvision import models, transforms
+from PIL import Image
+import urllib
+from urllib.error import HTTPError 
 import requests
 import sqlite3 
 import pickle
@@ -24,50 +29,97 @@ import math
 import statistics
 import datetime
 
+##
+NOT_BICYCLE_CLASS = "0"
+BICYCLE_CLASS = "1"
 
 verbose = True
 
-feature_store_path = "data/feature_store.db"
+FEATURE_STORE_PATH = "data/feature_store.db"
 
 # a subset of Open Images training data to be within 100MB github limit
-training_labels_path = 'data/oidv6-train-annotations-human-imagelabels-reduced.csv.gz'    
-training_images_path = 'data/oidv6-train-images-with-labels-with-rotation-reduced.csv.gz'
+TRAINING_LABELS_PATH = 'data/oidv6-train-annotations-human-imagelabels-reduced.csv.gz'
+TRAINING_IMAGES_PATH = 'data/oidv6-train-images-with-labels-with-rotation-reduced.csv.gz'
+
+VALIDATION_LABELS_PATH = 'data/validation-annotations-human-imagelabels.csv.gz'
+VALIDATION_IMAGES_PATH = 'data/validation-images-with-rotation.csv.gz'
+
+EVALUATION_LABELS_PATH = 'data/test-annotations-human-imagelabels.csv.gz'
+EVALUATION_IMAGES_PATH = 'data/test-images-with-rotation.csv.gz'
+
+NEW_TRAINING_DATA_PATH = 'data/new-training-data.csv'
+
+TRAININD_DATA_IMAGE_ID = 0
+TRAININD_DATA_ANNOTATION_URL = 1
+TRAININD_DATA_ANNOTATION_LABEL = 2
+
+class TrainingData(NamedTuple):
+    image_id: str
+    url: str
+    label: str
+
+
+class AnnotationDataWithScore(NamedTuple):
+    image_id: str
+    url: str
+    label: str
+    thumbnail_url: str
+    score: float
+
     
-validation_labels_path = 'data/validation-annotations-human-imagelabels.csv.gz'
-validation_images_path = 'data/validation-images-with-rotation.csv.gz'  
-  
-evaluation_labels_path = 'data/test-annotations-human-imagelabels.csv.gz'
-evaluation_images_path = 'data/test-images-with-rotation.csv.gz'  
-  
-new_training_data_path = 'data/new-training-data.csv'
+class AnnotationData(NamedTuple):
+    image_id: str
+    url: str
+    label: str
+    thumbnail_url: str
 
-unlabeled_items = []  
-validation_annotations = []  
-evaluation_annotations = []
+    def with_score(self, score: float)->AnnotationDataWithScore:
+        return AnnotationDataWithScore(
+                self.image_id, 
+                self.url, 
+                self.label, 
+                self.thumbnail_url,
+                score)
+    
+    
 
-pending_annotations = [] # annotations pending being stored
-new_training_data = {} # new training data by url
+unlabeled_items: List[AnnotationData] = []
+validation_annotations: List[AnnotationData] = []
+evaluation_annotations: List[AnnotationData] = []
 
-validation_urls = {} # validation item urls
 
-new_annotation_count = 0
-min_training_items = 5 # min items for each class to start training
+class PendingAnnotationData(NamedTuple):
+    url: str
+    is_bicycle: bool
 
-high_uncertainty_items = [] # items queued for annotation because of uncertainty
-model_based_outliers = [] # items queued for annotation because they are outliers and uncertain
 
-number_sampled_to_cache = 10 # how many active learning samples in memory to support rapid annotation
-number_to_sample_per_train = 50 # how many items to predict over for each new model
+pending_annotations: List[PendingAnnotationData] = []  # annotations pending being stored
+
+# image_id ->url
+new_training_data: Dict[str, str] = {}  # new training data by url
+
+validation_urls: Set[str] = set()  # validation item urls
+
+min_training_items = 5  # min items for each class to start training
+
+# For entries in high_uncertainty_items and model_based_outliers the confidence field should be set
+high_uncertainty_items: List[AnnotationDataWithScore] = []  # items queued for annotation because of uncertainty
+model_based_outliers: List[AnnotationDataWithScore] = []  # items queued for annotation because they are outliers and uncertain
+
+number_sampled_to_cache = 10  # how many active learning samples in memory to support rapid annotation
+number_to_sample_per_train = 50  # how many items to predict over for each new model
 # TODO: make these bigger before release
 
 
 total_time = 0.0 # total time to download new images and extract features
 total_downloads = 0 # total number of images downloaded 
 
-current_accuracies = [-1,-1,-1,-1, -1]
-current_model = None
+ACCURACIES_FSCORE_INDEX = 0
 
-feature_store = sqlite3.connect(feature_store_path)
+current_accuracies: List[float] = [-1, -1, -1, -1, -1]
+current_model: Optional[nn.Module] = None
+
+feature_store = sqlite3.connect(FEATURE_STORE_PATH)
 
 eel.init('./')
 
@@ -78,10 +130,10 @@ resnext50_sll_model=nn.Sequential(*modules)
 
 fasterrcnn_model = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
 
-bicycle_label_coco = 2 # label within coco dataset
-bicycle_label_oi = "/m/0199g" # label within open images dataset
+BICYCLE_LABEL_COCO = 2  # label within coco dataset
+BICYCLE_LABEL_OI = "/m/0199g"  # label within open images dataset
 
-image_id_urls = {} # image_ids indexed by url
+image_id_urls: Dict[str, str] = {}  # image_ids indexed by url
 
 
 class SimpleClassifier(nn.Module):  # inherit pytorch's nn.Module
@@ -89,12 +141,12 @@ class SimpleClassifier(nn.Module):  # inherit pytorch's nn.Module
 
     """
     
-    def __init__(self, num_labels, num_inputs):
+    def __init__(self, num_labels:int, num_inputs:int)->None:
         super(SimpleClassifier, self).__init__() # call parent init
         self.linear = nn.Linear(num_inputs, num_labels)
         
 
-    def forward(self, feature_vec, return_all_layers=False):
+    def forward(self, feature_vec:torch.Tensor, return_all_layers:bool=False)->Union[List[float], float]:
         # Define how data is passed through the model and what gets returned
 
         output = self.linear(feature_vec)
@@ -109,7 +161,7 @@ class SimpleClassifier(nn.Module):  # inherit pytorch's nn.Module
 
 # from: https://www.learnopencv.com/faster-r-cnn-object-detection-with-pytorch/
 # GET FASTER R CNN COCO DATASET PREDICTION FOR A BICYCLE
-def get_fasterrcnn_prediction(img):
+def get_fasterrcnn_prediction(img: Image.Image) -> List[float]:
     fasterrcnn_model.eval()
     # img = Image.open(file) # Load the image
     transform = transforms.Compose([transforms.ToTensor()]) # Defing PyTorch Transform
@@ -123,12 +175,12 @@ def get_fasterrcnn_prediction(img):
     pred_score = list(pred[0]['scores'].detach().numpy())
   
     max_bike = 0.0
-    bbox = [0, 0, width, height]
+    bbox: List[float] = [0, 0, width, height]
     for ind in range(0, len(pred_boxes)):
-      if ind == bicycle_label_coco:
-          if pred_score[ind] > max_bike:
-              max_bike = pred_score[ind]
-              bbox = pred_boxes[ind] # left, top, right, bottom
+        if ind == BICYCLE_LABEL_COCO:
+            if pred_score[ind] > max_bike:
+                max_bike = pred_score[ind]
+                bbox = pred_boxes[ind]  # left, top, right, bottom
     box_width = bbox[2] - bbox[0]
     box_height = bbox[3] - bbox[1]
     
@@ -153,8 +205,7 @@ def get_fasterrcnn_prediction(img):
 
 
 # GET RESNEXT50 IMAGENET DATASET PREDICTION FOR A BICYCLE
-def get_resnext_features(img):
-
+def get_resnext_features(img: Image.Image) -> List[float]:
     # img = Image.open(img_path)
     preprocess = transforms.Compose([
         transforms.Resize(256),
@@ -173,7 +224,7 @@ def get_resnext_features(img):
     return output.squeeze().detach().tolist()
   
 
-def make_feature_vector(image_id, url, label=""):    
+def make_feature_vector(image_id:str, url: str, label: str = "") -> Optional[torch.Tensor]:
     global total_time
     global total_downloads
     
@@ -184,16 +235,20 @@ def make_feature_vector(image_id, url, label=""):
     feature_list = get_features_from_store(image_id)
     
     # EXTRACT FEATURES FROM COCO & IMAGENET MODELS
-    if not feature_list:
+    if feature_list is None:
         start_time = time.time()
         
         try:
             img = Image.open(urllib.request.urlopen(url))
-        except urllib.error.HTTPError:        
+        except HTTPError:        
             record_missing_url(url)
             return None
 
         try:
+            # ensure that image is RGB image, as needed for resnet
+            if img.mode != 'RGB':
+                print(f"Converted {url} to rgb image")
+                img = img.convert('RGB')
             imagenet_features = get_fasterrcnn_prediction(img)
             eel.sleep(0.1)
             coco_features = get_resnext_features(img)          
@@ -207,10 +262,10 @@ def make_feature_vector(image_id, url, label=""):
             total_time += elapsed_time
             total_downloads += 1
             if verbose:
-                print("average number of seconds to process new image: "+str(total_time/total_downloads))
-            
-        except RuntimeError:
-            print("Problem with "+url)
+                print(f"average number of seconds to process new image: {total_time / total_downloads: 0.2f}")
+
+        except RuntimeError as e:
+            print(f"Problem with {url} {e}")
             record_bad_image(url)
             return None
             
@@ -220,54 +275,50 @@ def make_feature_vector(image_id, url, label=""):
     return vector.view(1, -1)
     
 
-def load_training_data(filepath):
+
+def load_training_data(filepath: str) -> Dict[str, str]:
     # FOR ALREADY LABELED ONLY
     # csv format: [IMAGE_ID, URL, LABEL,...]
-    global image_id_url
-    
     if not os.path.exists(filepath):
-        return []
+        print(f"No existing training data found")
+        return {}
     
     new_data = {}
     
     with open(filepath, 'r') as csvfile:
         reader = csv.reader(csvfile)
         for item in reader:
-            image_id = item[0]
-            url = item[1]
-            label = item[2]            
+            image_id = item[TRAININD_DATA_IMAGE_ID]
+            url = item[TRAININD_DATA_ANNOTATION_URL]
+            label = item[TRAININD_DATA_ANNOTATION_LABEL]
             new_data[url] = label
             image_id_urls[url] = image_id
-
+    print(f"Loaded {len(new_data)} training data points")
     return new_data
 
 
-def load_annotations(annotation_filepath, image_filepath, load_all = False):
+def load_annotations(annotation_labels_filepath: str, annotation_image_filepath: str, load_all: bool = False) -> List[
+    AnnotationData]:
     '''Load Open Images Annotations
       assume these are static, so we can pickle them to be loaded quicker     
     '''
     
-    cached_data = get_data_structure_store(image_filepath)
-    if cached_data:
-        for item in cached_data:
-            image_id = item[0]
-            url = item[1]
-            image_id_urls[url] = image_id
-            
+    cached_data = get_data_structure_store(annotation_image_filepath)
+    if cached_data is not None:
+        for annotated_data_point in cached_data:
+            image_id_urls[annotated_data_point.url] = annotated_data_point.image_id
         if verbose:
-            print("loaded cached data "+image_filepath)
+            print(f"loaded cached data {annotation_image_filepath} : {len(cached_data)} data points")
         return cached_data
 
-    global bicycle_label_oi
-    annotations = {}
-    annotated_data = []
-    
+    annotations: Dict[str, str] = {}
     c = 0
-    
-    file = gzip.open(annotation_filepath, mode='rt')
-    csvobj = csv.reader(file, delimiter = ',',quotechar='"')
+    ten_thousands = 0
+
+    file = gzip.open(annotation_labels_filepath, mode='rt', encoding="utf8")
+    csvobj = csv.reader(file, delimiter=',', quotechar='"')
     for row in csvobj:
-        if row[2] == bicycle_label_oi:
+        if row[2] == BICYCLE_LABEL_OI:
             image_id = row[0]
             label = row[3]
             annotations[image_id] = label
@@ -275,9 +326,18 @@ def load_annotations(annotation_filepath, image_filepath, load_all = False):
         if c == 10000:
             eel.sleep(0.01)
             c = 0
-                  
-    file = gzip.open(image_filepath, mode='rt')    
-    csvobj = csv.reader(file, delimiter = ',',quotechar='"')
+            ten_thousands += 1
+            if ten_thousands % 100 == 0:
+                print(f"processed {ten_thousands * 10000} points from {annotation_labels_filepath}")
+
+    print(f"Loaded {len(annotations)} annotated points from {annotation_labels_filepath}")
+
+    annotated_data = []
+    file = gzip.open(annotation_image_filepath, mode='rt', encoding="utf8")
+    csvobj = csv.reader(file, delimiter=',', quotechar='"')
+
+    c = 0
+    ten_thousands = 0
     for row in csvobj:
         # ImageID,Subset,OriginalURL,OriginalLandingURL,License,AuthorProfileURL,Author,Title,OriginalSize,OriginalMD5,Thumbnail300KURL,Rotation
         image_id = row[0]
@@ -294,45 +354,50 @@ def load_annotations(annotation_filepath, image_filepath, load_all = False):
                 label = annotations[image_id]
             else:
                 #implicit negative
-                label = 0
-                
-            annotated_data.append([image_id,url,label,thumbnail_url])
-            image_id_urls[url] = image_id
+                label = NOT_BICYCLE_CLASS
+
+            annotated_data.append(AnnotationData(image_id, url, label, thumbnail_url))
 
         c += 1
         if c == 10000:
             eel.sleep(0.01)
-            c = 0       
-            
-    store_data_structure(image_filepath, annotated_data)
-                  
+            c = 0
+            ten_thousands += 1
+            if ten_thousands % 10 == 0:
+                print(f"processed {ten_thousands * 10000} points from {annotation_image_filepath}")
+
+    print(f"Loaded {len(annotated_data)} data points from {annotation_image_filepath}. load_all={load_all}")
+
+    for annotated_data_point in annotated_data:
+        image_id_urls[annotated_data_point.url] = annotated_data_point.image_id
+    store_data_structure(annotation_image_filepath, annotated_data)
     return annotated_data
     
   
 
-def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, model=None):
+
+def train_model(batch_size: int = 20, num_epochs: int = 40, num_labels: int = 2, num_inputs: int = 2058, model: Optional[nn.Module]=None) -> \
+        Optional[nn.Module]:
     """Train model on the given training_data
 
     Tune with the validation_data
     Evaluate accuracy with the evaluation_data
     """
-    global new_training_data
-    global min_training_items
     global current_model
     global current_accuracies
-    global number_to_sample_per_train
-
-    if model == None:
-        model = SimpleClassifier(num_labels, num_inputs)
-
-
-    loss_function = nn.NLLLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
 
     if len(new_training_data) == 0:
         return None
         
     urls = list(new_training_data.keys())
+    if verbose:
+        print(f"Has {len(urls)} points for training")
+
+    if model is None:
+        model = SimpleClassifier(num_labels, num_inputs)
+
+    loss_function = nn.NLLLoss()
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
 
     # epochs training
     for epoch in range(num_epochs):
@@ -341,22 +406,22 @@ def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, mod
         # make a subset of data to use in this epoch
         # with an equal number of items from each label
         
-        bicycle = []
-        not_bicycle = []
+        bicycle: List[TrainingData] = []
+        not_bicycle: List[TrainingData] = []
 
         shuffle(urls) #randomize the order of the training data 
         for url in urls:
             label = new_training_data[url]
             if len(bicycle) >= batch_size and len(not_bicycle) >= batch_size:
                 break
-            elif new_training_data[url] == "1" and len(bicycle) < batch_size:
-                bicycle.append([image_id_urls[url], url, label])
-            elif new_training_data[url] == "0" and len(not_bicycle) < batch_size:
-                not_bicycle.append([image_id_urls[url], url, label])
-        
+            elif new_training_data[url] == BICYCLE_CLASS and len(bicycle) < batch_size:
+                bicycle.append(TrainingData(image_id_urls[url], url, label))
+            elif new_training_data[url] == NOT_BICYCLE_CLASS and len(not_bicycle) < batch_size:
+                not_bicycle.append(TrainingData(image_id_urls[url], url, label))
+
         if len(bicycle) < min_training_items or len(not_bicycle) < min_training_items:
             if verbose:
-                print("Not yet enough labels to train: "+str(len(bicycle))+ " of "+str(len(urls)))
+                print(f"Not yet enough labels to train: {len(bicycle)} of {len(urls)}")
             return None
         
         epoch_data = bicycle + not_bicycle
@@ -369,16 +434,16 @@ def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, mod
         # train our model
         for item in epoch_data:
             try:
-                image_id = item[0]
-                url = item[1]
-                label = int(item[2])
+                image_id = item.image_id
+                url = item.url
+                int_label = int(item.label)
 
                 feature_vec = make_feature_vector(image_id, url)
-                if feature_vec == None:
-                    print("no features for "+url)
+                if feature_vec is None:
+                    print(f"no features for {url}")
                     continue
             
-                target = torch.LongTensor([int(label)])
+                target = torch.LongTensor([int_label])
 
                 model.zero_grad() 
 
@@ -401,15 +466,15 @@ def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, mod
         fscore = round(fscore,3)
         auc = round(auc,3)
         if verbose:
-            print("Fscore/AUC = "+str(fscore)+" "+str(auc)+" "+str(precision)+" "+str(recall))
-        
-        if fscore > 0 and fscore > current_accuracies[0]:
-          
+            print(f"F-Score {fscore} AUC {auc} Precision {precision} Recall {recall}")
+
+        if fscore > 0 and fscore > current_accuracies[ACCURACIES_FSCORE_INDEX]:
+
             # evaluate on all *evaluation* data and save model 
             test_fscore, test_auc, test_precision, test_recall, test_ave_loss = evaluate_model(model, True, -1)
 
             if verbose:
-                print("Fscore/AUC = "+str(test_fscore)+" "+str(test_auc)+" "+str(test_precision)+" "+str(test_recall))
+                print(f"Test: F-Score {test_fscore} AUC = {test_auc} Precision {test_precision} Recall {test_recall}")
 
 
             test_auc = round(test_auc,3)
@@ -424,16 +489,15 @@ def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, mod
                 
             current_accuracies = [fscore, auc, precision, recall, ave_loss]
             current_model = model
-       
-        
-    if current_model == None:
+
+    if current_model is None:
         if verbose:
             print("Not getting predictions: we don't have a good model yet") 
     else:
         if verbose:
             print("Getting predictions across unlabeled items so we can sample with active learning")
-        
-        for i in range(0, number_to_sample_per_train):
+
+        for i in range(number_to_sample_per_train):
             get_random_prediction()
         
 
@@ -442,7 +506,8 @@ def train_model(batch_size=20, num_epochs=40, num_labels=2, num_inputs=2058, mod
  
  
 
-def evaluate_model(model, use_evaluation = True, limit = -1):
+
+def evaluate_model(model:nn.Module, use_evaluation: bool = True, limit:int=-1) -> List[float]:
     """Evaluate the model on the held-out evaluation data
 
     Return the f-value for disaster-bicycle and the AUC
@@ -482,14 +547,14 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
     count = 0
     for item in evaluation_data:
         if limit > 0 and count > limit:
-            break   
-        
-        image_id = item[0]
-        url = item[1]
-        label = item[2]
+            break
+
+        image_id = item.image_id
+        url = item.url
+        label = item.label
 
         feature_vector = make_feature_vector(image_id, url)
-        if feature_vector == None:
+        if feature_vector is None:
             continue
                 
         with torch.no_grad():
@@ -501,13 +566,12 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
         prob_bicycle = math.exp(log_probs.data.tolist()[0][1]) 
 
         # record loss if we have a label
-        if label != None:
-            target = torch.LongTensor([int(label)])           
+        if label is not None:
+            target = torch.LongTensor([int(label)])
             loss = loss_function(log_probs, target)
             total_loss += loss
 
-        
-        if(label == "1"):
+        if label == BICYCLE_CLASS:
             # true label is bicycle
             bicycle_confs.append(prob_bicycle)
             if prob_bicycle > 0.5:
@@ -523,8 +587,8 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
                 true_neg += 1.0
                     
         count += 1
-            
-    print(str(true_pos)+" "+str(false_pos)+" "+str(false_neg)+" "+str(true_neg))
+    data_type = 'Evaluation Data' if use_evaluation else 'Validation Data'
+    print(f"{data_type} - TruePos:{true_pos} False Pos: {false_pos} False Neg {false_neg} TrueNeg {true_neg}")
 
     ave_loss = total_loss / len(evaluation_data)
 
@@ -545,7 +609,7 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
         for conf2 in not_bicycle_confs:
             if conf <= conf2:
                 break
-            else:                  
+            else:
                 total_greater += 1
 
     denom = len(not_bicycle_confs) * len(bicycle_confs) 
@@ -553,36 +617,39 @@ def evaluate_model(model, use_evaluation = True, limit = -1):
 
     conf_b = statistics.mean(bicycle_confs)
     conf_n = statistics.mean(not_bicycle_confs)
-    print("ave confs: "+str(conf_b)+" "+str(conf_n))
-    print("ave loss: "+str(ave_loss))
+    print(f"{data_type} ave confs: {conf_b} {conf_n}")
+    print(f"{data_type} ave loss: {ave_loss}")
 
     return[fscore, auc, precision, recall, ave_loss]
 
 
-
-def load_most_recent_model(num_labels=2, num_inputs=2058):
+def load_most_recent_model(num_labels: int = 2, num_inputs: int = 2058) -> None:
     global current_model
     global current_accuracies
     
-    existing_models = os.listdir('models/')
+
+    existing_models = sorted(Path('models/').iterdir(), key=os.path.getmtime)
+    
     if len(existing_models) == 0:
         return
 
     last_model = existing_models[-1]
-    
-    current_model = SimpleClassifier(num_labels, num_inputs)
-    current_model.load_state_dict(torch.load('models/'+last_model))
-    
-    current_accuracies = evaluate_model(current_model, False, -1)
-            
-    print("loaded model: "+last_model)
+    # In order not to load Readme.md
+    if last_model.name.endswith(".params"):
+        
+        current_model = SimpleClassifier(num_labels, num_inputs)
+        current_model.load_state_dict(torch.load(str(last_model)))
+        
+        current_accuracies = evaluate_model(current_model, False, -1)
+                
+        print(f"loaded model: {last_model}")
     
     
         
 
 
 
-def get_quantized_logits(logits):
+def get_quantized_logits(logits: List[float])->float:
     ''' Returns the quanitized (0-1) logits
     
     '''
@@ -590,26 +657,25 @@ def get_quantized_logits(logits):
     return 1- (logits[0] + logits[1])
     
 
-def get_random_prediction(model = None):
+
+def get_random_prediction(model:Optional[nn.Module]=None) -> None:
     '''Get predictions on unlabeled data 
     
     '''
-    global unlabeled_items
-    global high_uncertainty_items 
-    global model_based_outliers 
-    global number_sampled_to_cache
-    global current_model
     
-    if model == None:
+    if model is None:
         model = current_model 
+    if model is None:
+        # should not happen -> safeguard
+        return 
     
-    item = random.choice(unlabeled_items) 
-    with torch.no_grad():        
-        image_id = item[0]
-        url = item[1]
-        
+    item: AnnotationData = random.choice(unlabeled_items)
+    with torch.no_grad():
+        image_id = item.image_id
+        url = item.url
+
         feature_vector = make_feature_vector(image_id, url)
-        if feature_vector == None:
+        if feature_vector is None:
             return
             
         logits, log_probs = model(feature_vector, return_all_layers = True)     
@@ -622,44 +688,37 @@ def get_random_prediction(model = None):
         outlier_score = get_quantized_logits(logits.data.tolist()[0])
             
         if len(high_uncertainty_items) < number_sampled_to_cache:
+            new_high_uncertainty_item = item.with_score(least_conf)
             if verbose or True:
-                print("adding an initial item to uncertainty samples")
+                print(f"adding an initial item to uncertainty samples {new_high_uncertainty_item}")
                 print(len(high_uncertainty_items))
-            while len(item) < 5:
-                item.append("")
-            item[4] = least_conf
-            high_uncertainty_items.append(item)
-        elif least_conf > high_uncertainty_items[-1][4]:
+            high_uncertainty_items.append(new_high_uncertainty_item)
+        elif least_conf > high_uncertainty_items[-1].score:
+            new_high_uncertainty_item = item.with_score(least_conf)
             if verbose or True:
-                print("adding to uncertainty samples "+str(least_conf))
-            while len(item) < 5:
-                item.append("")            
-            item[4] = least_conf
-            high_uncertainty_items.append(item)
+                print(f"adding to uncertainty samples {new_high_uncertainty_item}")
+            high_uncertainty_items.append(new_high_uncertainty_item)
             high_uncertainty_items.pop(-1)
-            high_uncertainty_items.sort(reverse=True, key=lambda x: x[4]) # TODO: RIGHT 
-                
+            high_uncertainty_items.sort(reverse=True, key=lambda x: x.score)  # TODO: RIGHT
+
         if least_conf > 0.5:
             if len(model_based_outliers) < number_sampled_to_cache:
+                outlier_item = item.with_score(outlier_score)
                 if verbose or True:
-                    print("adding an item initial item to outlier samples")
-                item[4] = outlier_score
-                model_based_outliers.append(item)
-            elif least_conf > model_based_outliers[-1][0]:
+                    print(f"adding an initial item {outlier_item} to outlier samples")
+                # Added in order to prevent exception in the next line
+                model_based_outliers.append(outlier_item)
+            elif least_conf > model_based_outliers[-1].score:
+                outlier_item = item.with_score(outlier_score)
                 if verbose or True:
-                    print("adding to outlier samples "+str(outlier_score))
-                item[4] = outlier_score
-                model_based_outliers.append(item)
+                    print(f"adding to outlier samples {outlier_item}")
+                model_based_outliers.append(outlier_item)
                 model_based_outliers.pop(-1)
-                model_based_outliers.sort(reverse=True,key=lambda x: x[4])
-        eel.sleep(0.1)        
-    
- 
- 
- 
- 
-  
-def create_feature_tables():
+                model_based_outliers.sort(reverse=True, key=lambda x: x.score)
+        eel.sleep(0.1)
+
+
+def create_feature_tables() -> None:
     with feature_store:
         feature_store.execute("""
            CREATE TABLE IF NOT EXISTS feature (
@@ -690,43 +749,44 @@ def create_feature_tables():
         """)
         
 
-        
-def record_missing_url(url):
+
+def record_missing_url(url:str) -> None:
     sql = 'INSERT OR REPLACE INTO url_missing (url) values(?)'
     feature_store.executemany(sql, [(url,)])
 
 
-def url_is_missing(url):
+def url_is_missing(url:str) -> bool:
     with feature_store:
-        data = feature_store.execute("SELECT * FROM url_missing WHERE url = '"+url+"'")
-        for row in data: 
-            return True # it exists      
+        data = feature_store.execute("SELECT * FROM url_missing WHERE url = '" + url + "'")
+        for _row in data:
+            return True  # it exists
         return False
 
 
-def record_bad_image(url):
+def record_bad_image(url:str) -> None:
     sql = 'INSERT OR REPLACE INTO bad_image (url) values(?)'
     feature_store.executemany(sql, [(url,)])
 
-def is_bad_image(url):
+
+def is_bad_image(url:str) -> bool:
     with feature_store:
-        data = feature_store.execute("SELECT * FROM bad_image WHERE url = '"+url+"'")
-        for row in data: 
-            return True # it exists
+        data = feature_store.execute("SELECT * FROM bad_image WHERE url = '" + url + "'")
+        for row in data:
+            return True  # it exists
         return False
 
 
-def store_data_structure(structure_name, data):
+def store_data_structure(structure_name: str, data: Any) -> None:
     sql = 'INSERT OR REPLACE INTO data_structure (name, data) values(?, ?)'
     pickled_data = pickle.dumps(data, pickle.HIGHEST_PROTOCOL)
     compressed_data = zlib.compress(pickled_data)
     feature_store.executemany(sql, [(structure_name, compressed_data)])
-    
- 
-def get_data_structure_store(structure_name):
+
+
+def get_data_structure_store(structure_name: str) -> Optional[List[AnnotationData]]:
     with feature_store:
-        data = feature_store.execute("SELECT name, data FROM data_structure WHERE name = '"+structure_name+"'")
-        for row in data: 
+        cursor = feature_store.execute("SELECT name, data FROM data_structure WHERE name = '"+structure_name+"'")
+        for row in cursor: 
             try:             
                 compressed_data = row[1]                
                 pickled_data = zlib.decompress(compressed_data)
@@ -734,20 +794,28 @@ def get_data_structure_store(structure_name):
             except Exception as e:
                 print("Couldn't load "+str(structure_name)+": "+str(e))
 
-                return False
-            return(data)        
-        return False
- 
-        
-def add_to_feature_store(image_id, features, url="", label=""):
+                return None
+            return data
+        return None
+
+
+def add_to_feature_store(image_id: str, features: List[float], url: str = "", label: str = "") -> None:
     sql = 'INSERT OR REPLACE INTO feature (image_id, url, features, label) values(?, ?, ?, ?)'
     pickled_features = pickle.dumps(features, pickle.HIGHEST_PROTOCOL)
     compressed_features = zlib.compress(pickled_features)
     feature_store.executemany(sql, [(image_id, url, compressed_features, str(label))])
 
 
+def get_features_in_feature_store() -> int:
+    with feature_store:
+        data = feature_store.execute(
+            "SELECT count(*) FROM feature")
+        for row in data:
+            return row[0]
+        #should be unreachable 
+        return 0    
 
-def get_features_from_store(image_id):
+def get_features_from_store(image_id:str)->Optional[List[float]]:
     with feature_store:
         data = feature_store.execute("SELECT image_id, url, features, label FROM feature WHERE image_id = '"+image_id+"'")
         for row in data: 
@@ -756,48 +824,40 @@ def get_features_from_store(image_id):
                 pickled_features = zlib.decompress(compressed_features)
                 features = pickle.loads(pickled_features)
             except Exception as e:
-                print("Couldn't load "+image_id+" : "+str(e))
-                return False
-            return(features)
-        
-        return False
+                print("Couldn't load " + image_id + " : " + str(e))
+                return None
+            return features
+
+        return None
 
 
-
-def add_pending_annotations():
-    global pending_annotations
-    global image_id_urls
-    global new_training_data
-    global new_training_data_path
-    global verbose
-    
+def add_pending_annotations()->None:
     while True:
-        not_cached = 0
-
         # copy to avoid race conditions
         if len(pending_annotations) > 0 and verbose:
             print("adding pending annotations")
         
         found_annotation = None
         for annotation in pending_annotations:
-            is_bicycle = annotation[1]
+            is_bicycle = annotation.is_bicycle
             if is_bicycle:
                 if verbose:
                     print("prioritizing positive annotation")
-                
-                label = "1"
-                url = annotation[0]
+
+                label = BICYCLE_CLASS
+                url = annotation.url
                 image_id = image_id_urls[url]
                 
                 # cache features for faster training later
-                eel.sleep(0.01) # allow other processes in
-                features = make_feature_vector(image_id, url, label)            
-                eel.sleep(0.1) # allow other processes in
-                
-                append_data(new_training_data_path, [[image_id, url, label]])
-                new_training_data[url] = label
-                found_annotation = annotation
-        
+                eel.sleep(0.01)  # allow other processes in
+                feature_vector = make_feature_vector(image_id, url, label)
+                eel.sleep(0.1)  # allow other processes in
+
+                if feature_vector is not None:
+                    append_data(NEW_TRAINING_DATA_PATH, [[image_id, url, label]])
+                    new_training_data[url] = label
+                    found_annotation = annotation
+
         if found_annotation:
             prior_num = len(pending_annotations)
             pending_annotations.remove(found_annotation) 
@@ -806,69 +866,63 @@ def add_pending_annotations():
                 print("Warning did not remove item from list")
                    
         elif len(pending_annotations) > 0:
-            label = "0"
+            label = NOT_BICYCLE_CLASS
             annotation = pending_annotations.pop()
-            url = annotation[0]
+            url = annotation.url
             image_id = image_id_urls[url]
                 
             # cache features for faster training later
-            eel.sleep(0.01) # allow other processes in
-            features = make_feature_vector(image_id, url, label)            
-            eel.sleep(0.1) # allow other processes in
-                
-            append_data(new_training_data_path, [[image_id, url, label]])
-            new_training_data[url] = label
-            found_annotation = annotation
-        else:            
+            eel.sleep(0.01)  # allow other processes in
+            feature_vector = make_feature_vector(image_id, url, label)
+            eel.sleep(0.1)  # allow other processes in
+            if feature_vector is not None:
+                append_data(NEW_TRAINING_DATA_PATH, [[image_id, url, label]])
+                new_training_data[url] = label
+        else:
             eel.sleep(1)
         
 
 
-def append_data(filepath, data):
-    with open(filepath, 'a', errors='replace') as csvfile:
+def append_data(filepath: str, data: List[List[str]]) -> None:
+    with open(filepath, 'a', errors='replace', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerows(data)
     csvfile.close()
 
- 
-@eel.expose 
-def training_loaded():
+
+@eel.expose
+def training_loaded() -> bool:
     return len(unlabeled_items) > 0
-       
-@eel.expose 
-def validation_loaded():
-    return len(validation_annotations) > 0
-       
- 
-@eel.expose   
-def get_current_accuracies():
-    global current_accuracies
-    return current_accuracies   
 
 
 @eel.expose
-def estimate_processing_time():
-    global total_time 
-    global total_downloads 
-    global pending_annotations
+def validation_loaded() -> bool:
+    return len(validation_annotations) > 0
+
+
+@eel.expose
+def get_current_accuracies() -> List[float]:
+    return current_accuracies
+
+
+@eel.expose
+def estimate_processing_time()->float:
     total_pending = len(pending_annotations)
     
     if total_downloads == 0:
         return 0 # no info yet
     else:
         if verbose:
-            print([total_time, total_downloads, total_pending])
+            print(f"Total Time: {total_time}, Total Downloads {total_downloads}, Total Pending {total_pending}")
         return (total_time / total_downloads) * total_pending
 
 @eel.expose
-def add_annotation(url, is_bicycle):
-    global pending_annotations
-        
+def add_annotation(url:str, is_bicycle:bool)->None:
     if url not in validation_urls:
         if verbose:
-            print("adding annotation for "+url)
-        
-        pending_annotations.append([url, is_bicycle])
+            print(f"adding annotation for {url} {is_bicycle}")
+
+        pending_annotations.append(PendingAnnotationData(url, is_bicycle))
         eel.sleep(0.01)
     else:
         if verbose:
@@ -876,15 +930,7 @@ def add_annotation(url, is_bicycle):
 
 
 @eel.expose
-def get_next_image():
-    global validation_annotations
-    global unlabeled_items
-    global test_annotations
-    global high_uncertainty_items
-    global model_based_outliers 
-    
-    annotations = unlabeled_items
-    
+def get_next_image()->List[str]:
     if len(validation_annotations) == 0:
         return [] # not yet loaded
     if len(unlabeled_items) == 0:
@@ -896,76 +942,72 @@ def get_next_image():
         return get_validation_image()
     elif strategy == 1 or len(high_uncertainty_items) == 0:
         return get_random_image()
-    elif strategy < 9:
+    elif strategy < 9 or len(model_based_outliers) == 0:
         return get_uncertain_image()
     else:
         return get_outlier_image()
     
 
 # get image with high uncertainty    
-def get_uncertain_image():
-    global high_uncertainty_items
-    return high_uncertainty_items.pop()
+def get_uncertain_image()->List[str]:
+    last_image = high_uncertainty_items.pop()
+    return [last_image.url, last_image.thumbnail_url, last_image.label]
 
     
 # get image that is model-based outlier and also uncertain
-def get_outlier_image():
-    global model_based_outliers 
-    return model_based_outliers.pop()
-    
-    
-        
+def get_outlier_image()->List[str]:
+    last_image = model_based_outliers.pop()
+    return [last_image.url, last_image.thumbnail_url, last_image.label]
 
-def get_validation_image():
-    global validation_annotations
+
+def get_validation_image()->List[str]:
     shuffle(validation_annotations)
     label = random.randint(0,1)
     for item in validation_annotations:
-        if str(item[2]) != str(label):
+        if str(item.label) != str(label):
             continue
-          
-        url = item[1]  
-        thumbnail_url = item[3]
+
+        url = item.url
         if url_is_missing(url) or is_bad_image(url) or not test_if_url_ok(url):
             continue
+
+        thumbnail_url = item.thumbnail_url
         if not test_if_url_ok(thumbnail_url):
             thumbnail_url = url
         
-        return [url, thumbnail_url, label]
-        
-    return [] # if there are no items
-        
-        
+        return [url, thumbnail_url, str(label)]
 
-def get_random_image():
-    global unlabeled_items
+    return []  # if there are no items
+
+
+def get_random_image() -> List[str]: #type: ignore
 
     url = ""
     while url == "":
         item = random.choice(unlabeled_items)
-        image_id = item[0]
-        url = item[1]
-        label = "" # we're getting new labels so ignore OI ones            
-        thumbnail_url = item[3]
-    
+        image_id = item.image_id
+        url = item.url
+        label = ""  # we're getting new labels so ignore OI ones
+        thumbnail_url = item.thumbnail_url
+
         if url in new_training_data or url_is_missing(url) or is_bad_image(url):
             url = ""
             continue
         try:
             if not test_if_url_ok(url):
                 url = ""
-                break
+                continue
             if not test_if_url_ok(thumbnail_url):
                 thumbnail_url = url
-                
-            return [url, thumbnail_url, label] 
+
+            return [url, thumbnail_url, label]
 
         except:
-            print(" error with url "+url+" thumb "+thumbnail_url)
+            print(f"error with image_id {image_id} url {url} thumb {thumbnail_url}")
             url = ""
 
-    
-def test_if_url_ok(url):
+
+def test_if_url_ok(url: str) -> bool:
     if len(url) == 0:
         return False
     response = requests.head(url)
@@ -979,36 +1021,35 @@ create_feature_tables()
 
 
 
-def load_data():
+
+def load_data() -> None:
     global validation_annotations
     global evaluation_annotations
     global unlabeled_items
-    global test_annotations
-    global new_training_data_path
     global new_training_data
 
+    print(f"There are {get_features_in_feature_store()} cached image features in feature_store")
+
     print("loading val")
-    validation_annotations = load_annotations(validation_labels_path, validation_images_path, load_all = False)  
+    validation_annotations = load_annotations(VALIDATION_LABELS_PATH, VALIDATION_IMAGES_PATH, load_all=False)
     for item in validation_annotations:
-        validation_urls[item[1]] = True
+        validation_urls.add(item.url)
 
     print("loading existing annotations")
-    new_training_data = load_training_data(new_training_data_path)
-    print(len(new_training_data))
+    new_training_data = load_training_data(NEW_TRAINING_DATA_PATH)
     
     print("loading eval")
-    evaluation_annotations = load_annotations(evaluation_labels_path, evaluation_images_path, load_all = False)  
+    evaluation_annotations = load_annotations(EVALUATION_LABELS_PATH, EVALUATION_IMAGES_PATH, load_all=False)
 
     print("loading train")
-    unlabeled_items = load_annotations(training_labels_path, training_images_path, load_all = True)  
+    unlabeled_items = load_annotations(TRAINING_LABELS_PATH, TRAINING_IMAGES_PATH, load_all=True)
     print("all data loaded")
 
     load_most_recent_model()
 
 
-
-def continually_retrain():
-    while True:        
+def continually_retrain() -> None:
+    while True:
         train_model()
         eel.sleep(20) # Use eel.sleep(), not time.sleep()
 
