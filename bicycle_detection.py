@@ -755,6 +755,10 @@ def record_missing_url(url:str) -> None:
 
 
 def url_is_missing(url:str) -> bool:
+    # skipping blank urls - during initial parsing of training data, information about bad urls will not be yet available
+    if url is None or not url.strip():
+        return True
+
     with feature_store:
         data = feature_store.execute("SELECT * FROM url_missing WHERE url = '" + url + "'")
         for _row in data:
