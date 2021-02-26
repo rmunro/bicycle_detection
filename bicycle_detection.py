@@ -1,34 +1,35 @@
-import eel, os, random, sys, re
-import time
-import gzip
 import csv
-import hashlib
+import datetime
+import gzip
+import pickle
 import random
-from random import shuffle
-from typing import List, Optional, Dict, NamedTuple, Tuple, Any, Set, Union
+import sqlite3
+import statistics
+import time
+import urllib
+import zlib
 from pathlib import Path
+from random import shuffle
+from typing import List, Optional, Dict, NamedTuple, Any, Set, Union, Tuple
+from urllib.error import HTTPError
 
-
-##
-
+import eel
+import math
+import os
+import re
+import requests
 # import torchvision.models as models
-import torch 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import models, transforms
 from PIL import Image
-import urllib
-from urllib.error import HTTPError 
-import requests
-import sqlite3 
-import pickle
-import zlib
-import math
-import statistics
-import datetime
+from torchvision import models, transforms
 
 ##
+
+##
+NO_LABEL = ""
 NOT_BICYCLE_CLASS = "0"
 BICYCLE_CLASS = "1"
 
@@ -72,19 +73,16 @@ class AnnotationData(NamedTuple):
     label: str
     thumbnail_url: str
 
-    def with_score(self, score: float)->AnnotationDataWithScore:
-        return AnnotationDataWithScore(
-                self.image_id, 
-                self.url, 
-                self.label, 
-                self.thumbnail_url,
-                score)
-    
-    
+    def with_score_and_no_label(self, score: float) -> AnnotationDataWithScore:
 
-unlabeled_items: List[AnnotationData] = []
-validation_annotations: List[AnnotationData] = []
-evaluation_annotations: List[AnnotationData] = []
+        return AnnotationDataWithScore(
+            self.image_id,
+            self.url,
+            # we're getting new labels so ignore OI ones
+            NO_LABEL,
+            self.thumbnail_url,
+            score)
+
 
 
 class PendingAnnotationData(NamedTuple):
@@ -92,9 +90,14 @@ class PendingAnnotationData(NamedTuple):
     is_bicycle: bool
 
 
+
+unlabeled_items: List[AnnotationData] = []
+validation_annotations: List[AnnotationData] = []
+evaluation_annotations: List[AnnotationData] = []
+
 pending_annotations: List[PendingAnnotationData] = []  # annotations pending being stored
 
-# image_id ->url
+# url -> label
 new_training_data: Dict[str, str] = {}  # new training data by url
 
 validation_urls: Set[str] = set()  # validation item urls
@@ -143,9 +146,8 @@ class SimpleClassifier(nn.Module):  # inherit pytorch's nn.Module
     def __init__(self, num_labels:int, num_inputs:int)->None:
         super(SimpleClassifier, self).__init__() # call parent init
         self.linear = nn.Linear(num_inputs, num_labels)
-        
 
-    def forward(self, feature_vec:torch.Tensor, return_all_layers:bool=False)->Union[List[float], float]:
+    def forward(self, feature_vec: torch.Tensor, return_all_layers: bool = False) -> Union[List[torch.Tensor], torch.Tensor]:
         # Define how data is passed through the model and what gets returned
 
         output = self.linear(feature_vec)
@@ -292,7 +294,9 @@ def load_training_data(filepath: str) -> Dict[str, str]:
             label = item[TRAININD_DATA_ANNOTATION_LABEL]
             new_data[url] = label
             image_id_urls[url] = image_id
-    print(f"Loaded {len(new_data)} training data points")
+    count_pos = sum(map(int, list(new_data.values())))
+    count_total = len(new_data)
+    print(f"Loaded {count_total} training data points {count_pos} positive and {count_total-count_pos} negative")
     return new_data
 
 
@@ -307,7 +311,9 @@ def load_annotations(annotation_labels_filepath: str, annotation_image_filepath:
         for annotated_data_point in cached_data:
             image_id_urls[annotated_data_point.url] = annotated_data_point.image_id
         if verbose:
-            print(f"loaded cached data {annotation_image_filepath} : {len(cached_data)} data points")
+            count_neg, count_pos = compute_pos_neg_counts(cached_data)
+            print(f"loaded cached data {annotation_image_filepath} : {len(cached_data)} data points "
+                  f"{count_pos} pos and {count_neg} neg")
         return cached_data
 
     annotations: Dict[str, str] = {}
@@ -365,7 +371,10 @@ def load_annotations(annotation_labels_filepath: str, annotation_image_filepath:
             if ten_thousands % 10 == 0:
                 print(f"processed {ten_thousands * 10000} points from {annotation_image_filepath}")
 
-    print(f"Loaded {len(annotated_data)} data points from {annotation_image_filepath}. load_all={load_all}")
+    count_neg, count_pos = compute_pos_neg_counts(annotated_data)
+
+    print(f"Loaded {len(annotated_data)} data points from {annotation_image_filepath}. "
+          f"Pos ={count_pos} Neg={count_neg} load_all={load_all}")
 
     for annotated_data_point in annotated_data:
         image_id_urls[annotated_data_point.url] = annotated_data_point.image_id
@@ -373,6 +382,17 @@ def load_annotations(annotation_labels_filepath: str, annotation_image_filepath:
     return annotated_data
     
   
+
+
+def compute_pos_neg_counts(cached_data: List[AnnotationData])->Tuple[int, int]:
+    count_pos = 0
+    count_neg = 0
+    for annotated_data_point in cached_data:
+        if annotated_data_point.label == BICYCLE_CLASS:
+            count_pos += 1
+        else:
+            count_neg += 1
+    return count_neg, count_pos
 
 
 def train_model(batch_size: int = 20, num_epochs: int = 40, num_labels: int = 2, num_inputs: int = 2058, model: Optional[nn.Module]=None) -> \
@@ -530,10 +550,12 @@ def evaluate_model(model:nn.Module, use_evaluation: bool = True, limit:int=-1) -
     
     if use_evaluation:
         evaluation_data = evaluation_annotations
+        data_type = 'Evaluation Data'
         if verbose:
             print("running evaluation data")
     else:
         evaluation_data = validation_annotations
+        data_type = 'Validation Data'
         if verbose:
             print("running validation data")
 
@@ -586,7 +608,6 @@ def evaluate_model(model:nn.Module, use_evaluation: bool = True, limit:int=-1) -
                 true_neg += 1.0
                     
         count += 1
-    data_type = 'Evaluation Data' if use_evaluation else 'Validation Data'
     print(f"{data_type} - TruePos:{true_pos} False Pos: {false_pos} False Neg {false_neg} TrueNeg {true_neg}")
 
     ave_loss = total_loss / len(evaluation_data)
@@ -606,12 +627,14 @@ def evaluate_model(model:nn.Module, use_evaluation: bool = True, limit:int=-1) -
     total_greater = 0 # count of how many total have higher confidence
     for conf in bicycle_confs:
         for conf2 in not_bicycle_confs:
-            if conf <= conf2:
+            if conf < conf2:
                 break
+            elif conf == conf2:
+                total_greater += 0.5
             else:
-                total_greater += 1
+                total_greater += 1.
 
-    denom = len(not_bicycle_confs) * len(bicycle_confs) 
+    denom = len(not_bicycle_confs) * len(bicycle_confs)
     auc = total_greater / denom
 
     conf_b = statistics.mean(bicycle_confs)
@@ -640,12 +663,8 @@ def load_most_recent_model(num_labels: int = 2, num_inputs: int = 2058) -> None:
         current_model.load_state_dict(torch.load(str(last_model)))
         
         current_accuracies = evaluate_model(current_model, False, -1)
-                
-        print(f"loaded model: {last_model}")
-    
-    
-        
 
+        print(f"loaded model: {last_model} Accuracies: {current_accuracies}")
 
 
 def get_quantized_logits(logits: List[float])->float:
@@ -657,18 +676,34 @@ def get_quantized_logits(logits: List[float])->float:
     
 
 
-def get_random_prediction(model:Optional[nn.Module]=None) -> None:
+def get_random_unlabelled_item() -> AnnotationData:
+    '''Get random item from unlabelled data, making sure that it is not yet labelled.'''
+    if len(new_training_data) == len(unlabeled_items):
+        if verbose:
+            print("All items are already labelled")
+        raise ValueError("All data is labelled")
+    while True:
+        item: AnnotationData = random.choice(unlabeled_items)
+        if item.url in new_training_data:
+            continue
+        if url_is_missing(item.url) or is_bad_image(item.url):
+            continue
+        if not test_if_url_ok(item.url):
+            continue
+        return item
+
+def get_random_prediction(model: Optional[nn.Module] = None) -> None:
     '''Get predictions on unlabeled data 
     
     '''
-    
+
     if model is None:
-        model = current_model 
+        model = current_model
     if model is None:
         # should not happen -> safeguard
-        return 
-    
-    item: AnnotationData = random.choice(unlabeled_items)
+        return
+
+    item: AnnotationData = get_random_unlabelled_item()
     with torch.no_grad():
         image_id = item.image_id
         url = item.url
@@ -687,32 +722,35 @@ def get_random_prediction(model:Optional[nn.Module]=None) -> None:
         outlier_score = get_quantized_logits(logits.data.tolist()[0])
             
         if len(high_uncertainty_items) < number_sampled_to_cache:
-            new_high_uncertainty_item = item.with_score(least_conf)
+            new_high_uncertainty_item = item.with_score_and_no_label(least_conf)
             if verbose or True:
                 print(f"adding an initial item to uncertainty samples {new_high_uncertainty_item}")
                 print(len(high_uncertainty_items))
             high_uncertainty_items.append(new_high_uncertainty_item)
         elif least_conf > high_uncertainty_items[-1].score:
-            new_high_uncertainty_item = item.with_score(least_conf)
+            new_high_uncertainty_item = item.with_score_and_no_label(least_conf)
             if verbose or True:
                 print(f"adding to uncertainty samples {new_high_uncertainty_item}")
-            high_uncertainty_items.append(new_high_uncertainty_item)
+            #need to remove before append, otherwise newly appended item will be immediatedly removed
             high_uncertainty_items.pop(-1)
+            high_uncertainty_items.append(new_high_uncertainty_item)
             high_uncertainty_items.sort(reverse=True, key=lambda x: x.score)  # TODO: RIGHT
 
         if least_conf > 0.5:
             if len(model_based_outliers) < number_sampled_to_cache:
-                outlier_item = item.with_score(outlier_score)
+                outlier_item = item.with_score_and_no_label(outlier_score)
                 if verbose or True:
                     print(f"adding an initial item {outlier_item} to outlier samples")
                 # Added in order to prevent exception in the next line
                 model_based_outliers.append(outlier_item)
+            #TODO: here comparison between least_conf and score looks strange. Maybe comparison should be with outlier_score
             elif least_conf > model_based_outliers[-1].score:
-                outlier_item = item.with_score(outlier_score)
+                outlier_item = item.with_score_and_no_label(outlier_score)
                 if verbose or True:
                     print(f"adding to outlier samples {outlier_item}")
-                model_based_outliers.append(outlier_item)
+                #need to remove before append, otherwise newly appended item will be immediatedly removed
                 model_based_outliers.pop(-1)
+                model_based_outliers.append(outlier_item)
                 model_based_outliers.sort(reverse=True, key=lambda x: x.score)
         eel.sleep(0.1)
 
@@ -857,33 +895,39 @@ def add_pending_annotations()->None:
                 eel.sleep(0.1)  # allow other processes in
 
                 if feature_vector is not None:
-                    append_data(NEW_TRAINING_DATA_PATH, [[image_id, url, label]])
-                    new_training_data[url] = label
+                    if url not in new_training_data:
+                        append_data(NEW_TRAINING_DATA_PATH, [[image_id, url, label]])
+                        new_training_data[url] = label
+                    else:
+                        print(f"Got already annotated image as pending image id {image_id} url: {url}. Skipping it")
                     found_annotation = annotation
 
         if found_annotation:
             prior_num = len(pending_annotations)
-            pending_annotations.remove(found_annotation) 
+            pending_annotations.remove(found_annotation)
             after_num = len(pending_annotations)
             if after_num + 1 != prior_num:
                 print("Warning did not remove item from list")
-                   
+
         elif len(pending_annotations) > 0:
             label = NOT_BICYCLE_CLASS
             annotation = pending_annotations.pop()
             url = annotation.url
             image_id = image_id_urls[url]
-                
+
             # cache features for faster training later
             eel.sleep(0.01)  # allow other processes in
             feature_vector = make_feature_vector(image_id, url, label)
             eel.sleep(0.1)  # allow other processes in
             if feature_vector is not None:
-                append_data(NEW_TRAINING_DATA_PATH, [[image_id, url, label]])
-                new_training_data[url] = label
+                if url not in new_training_data:
+                    append_data(NEW_TRAINING_DATA_PATH, [[image_id, url, label]])
+                    new_training_data[url] = label
+                else:
+                    if verbose:
+                        print(f"Got already annotated image as pending image id {image_id} url: {url}. Skipping it")
         else:
             eel.sleep(1)
-        
 
 
 def append_data(filepath: str, data: List[List[str]]) -> None:
@@ -919,17 +963,26 @@ def estimate_processing_time()->float:
             print(f"Total Time: {total_time}, Total Downloads {total_downloads}, Total Pending {total_pending}")
         return (total_time / total_downloads) * total_pending
 
+
 @eel.expose
 def add_annotation(url:str, is_bicycle:bool)->None:
     if url not in validation_urls:
-        if verbose:
-            print(f"adding annotation for {url} {is_bicycle}")
+        if url not in new_training_data:
+            if verbose:
+                print(f"adding annotation for {url} {is_bicycle}")
 
-        pending_annotations.append(PendingAnnotationData(url, is_bicycle))
-        eel.sleep(0.01)
+            pending_annotations.append(PendingAnnotationData(url, is_bicycle))
+            eel.sleep(0.01)
+        else:
+            new_label = BICYCLE_CLASS if is_bicycle else NOT_BICYCLE_CLASS
+            if new_training_data[url] != new_label:
+                if verbose:
+                    print(f"Already annotated image {url} is attempted to be annotated with another label {new_label}")
+            if verbose:
+                print(f"Skipping adding already annotated image {url}")
     else:
         if verbose:
-            print("skipping validation: "+url)
+            print(f"Skipping validation: {url}")
 
 
 @eel.expose
@@ -949,17 +1002,19 @@ def get_next_image()->List[str]:
         return get_uncertain_image()
     else:
         return get_outlier_image()
-    
+
 
 # get image with high uncertainty    
-def get_uncertain_image()->List[str]:
-    last_image = high_uncertainty_items.pop()
+def get_uncertain_image() -> List[str]:
+    # by default pop removes last element of list. If we would like to return
+    # element with highest score, the first element should be removed
+    last_image = high_uncertainty_items.pop(0)
     return [last_image.url, last_image.thumbnail_url, last_image.label]
 
-    
+
 # get image that is model-based outlier and also uncertain
-def get_outlier_image()->List[str]:
-    last_image = model_based_outliers.pop()
+def get_outlier_image() -> List[str]:
+    last_image = model_based_outliers.pop(0)
     return [last_image.url, last_image.thumbnail_url, last_image.label]
 
 
@@ -983,27 +1038,20 @@ def get_validation_image()->List[str]:
     return []  # if there are no items
 
 
-def get_random_image() -> List[str]: #type: ignore
+def get_random_image() -> List[str]:  # type: ignore
 
     url = ""
     while url == "":
-        item = random.choice(unlabeled_items)
+        item = get_random_unlabelled_item()
         image_id = item.image_id
         url = item.url
-        label = ""  # we're getting new labels so ignore OI ones
-        thumbnail_url = item.thumbnail_url
 
-        if url in new_training_data or url_is_missing(url) or is_bad_image(url):
-            url = ""
-            continue
+        thumbnail_url = item.thumbnail_url
         try:
-            if not test_if_url_ok(url):
-                url = ""
-                continue
             if not test_if_url_ok(thumbnail_url):
                 thumbnail_url = url
-
-            return [url, thumbnail_url, label]
+            # we're getting new labels so ignore OI ones
+            return [url, thumbnail_url, NO_LABEL]
 
         except:
             print(f"error with image_id {image_id} url {url} thumb {thumbnail_url}")
